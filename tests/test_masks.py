@@ -3,7 +3,7 @@ import unittest
 import torch
 import torch.nn.functional as F
 
-from nodes import MaskBuilder, PixelLockComposite, _denoise_mask_from_lock, _has_mask_effect, _is_full_denoise_mask
+from nodes import MaskBuilder, PixelLockComposite, _has_mask_effect, _is_full_denoise_mask, _latent_denoise_mask
 
 
 class MaskBuilderTests(unittest.TestCase):
@@ -78,7 +78,7 @@ class PixelLockCompositeTests(unittest.TestCase):
 
 
 class PixelLockSamplerMaskTests(unittest.TestCase):
-    def test_lock_alpha_becomes_inverse_denoise_mask(self):
+    def test_lock_mask_controls_denoise_strengths(self):
         hard = torch.zeros((1, 1, 4, 4))
         soft = torch.zeros((1, 1, 4, 4))
         hard[:, :, 1:3, 1:3] = 1.0
@@ -89,11 +89,11 @@ class PixelLockSamplerMaskTests(unittest.TestCase):
             "full_edit": (1.0 - hard - soft).clamp(0.0, 1.0),
         }
 
-        denoise_mask = _denoise_mask_from_lock(pixel_lock_mask, 4, 4, boundary_strength=0.25)
+        denoise_mask = _latent_denoise_mask(pixel_lock_mask, 4, 4, boundary_strength=0.25, edit_strength=0.85)
 
         self.assertTrue(torch.all(denoise_mask[:, :, 1:3, 1:3] == 0.0))
         self.assertTrue(torch.all(denoise_mask[:, :, 0, :] == 0.75))
-        self.assertEqual(float(denoise_mask[:, :, 3, 0]), 1.0)
+        self.assertAlmostEqual(float(denoise_mask[:, :, 3, 0]), 0.85)
 
     def test_no_lock_can_skip_inpaint_mask_path(self):
         denoise_mask = torch.ones((1, 1, 4, 4))

@@ -119,8 +119,19 @@ def _latent_lock_alpha(pixel_lock_mask: dict[str, Any], height: int, width: int,
     return (hard_keep + soft_keep * boundary_strength).clamp(0.0, 1.0)
 
 
-def _denoise_mask_from_lock(pixel_lock_mask: dict[str, Any], height: int, width: int, boundary_strength: float) -> torch.Tensor:
-    return (1.0 - _latent_lock_alpha(pixel_lock_mask, height, width, boundary_strength)).clamp(0.0, 1.0)
+def _latent_denoise_mask(
+    pixel_lock_mask: dict[str, Any],
+    height: int,
+    width: int,
+    boundary_strength: float,
+    edit_strength: float,
+) -> torch.Tensor:
+    hard_keep, soft_keep, full_edit = _extract_pixel_lock_mask(pixel_lock_mask)
+    soft_keep = _resize_mask(soft_keep, height, width, mode="bilinear")
+    full_edit = _resize_mask(full_edit, height, width, mode="nearest")
+    boundary_strength = float(max(0.0, min(1.0, boundary_strength)))
+    edit_strength = float(max(0.0, min(1.0, edit_strength)))
+    return (soft_keep * (1.0 - boundary_strength) + full_edit * edit_strength).clamp(0.0, 1.0)
 
 
 def _has_mask_effect(mask: torch.Tensor, epsilon: float = 1e-6) -> bool:
@@ -151,15 +162,8 @@ def _apply_latent_lock(current: torch.Tensor, original: torch.Tensor, alpha: tor
     return current * (1.0 - alpha) + original * alpha
 
 
-def _encode_original_latent(vae: Any, original_image: torch.Tensor, latent_image: dict[str, Any]) -> torch.Tensor:
-    if "samples" not in latent_image:
-        raise ValueError("LATENT input is missing the 'samples' tensor.")
-
-    encoded = vae.encode(original_image)
-    target = latent_image["samples"]
-    if encoded.shape[-2:] != target.shape[-2:]:
-        encoded = F.interpolate(encoded, size=target.shape[-2:], mode="bilinear", align_corners=False)
-    return encoded
+def _encode_original_latent(vae: Any, original_image: torch.Tensor) -> torch.Tensor:
+    return vae.encode(original_image)
 
 
 def _sample_with_lock(
@@ -171,43 +175,39 @@ def _sample_with_lock(
     scheduler: str,
     positive: Any,
     negative: Any,
-    latent: dict[str, Any],
     original_samples: torch.Tensor | None,
+    batch_inds: Any | None,
     original_image: torch.Tensor | None,
     vae: Any | None,
     pixel_lock_mask: dict[str, Any],
     boundary_strength: float,
     denoise: float,
+    edit_strength: float,
 ) -> tuple[dict[str, Any]]:
     if comfy is None or latent_preview is None:
         raise RuntimeError("PixelLockSampler must be run inside ComfyUI.")
 
-    latent_image = latent["samples"]
-    latent_image = comfy.sample.fix_empty_latent_channels(
-        model,
-        latent_image,
-        latent.get("downscale_ratio_spacial", None),
-    )
+    if original_samples is None:
+        if original_image is None or vae is None:
+            raise ValueError("PixelLockSampler needs original_latent or original_image+vae.")
+        original_samples = _encode_original_latent(vae, _image_to_bhwc(original_image))
 
-    batch_inds = latent["batch_index"] if "batch_index" in latent else None
-    noise = comfy.sample.prepare_noise(latent_image, seed, batch_inds)
+    original_samples = comfy.sample.fix_empty_latent_channels(model, original_samples, None)
+    noise = comfy.sample.prepare_noise(original_samples, seed, batch_inds)
     base_callback = latent_preview.prepare_callback(model, steps)
     disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
-    alpha = _latent_lock_alpha(pixel_lock_mask, latent_image.shape[-2], latent_image.shape[-1], boundary_strength)
+    alpha = _latent_lock_alpha(pixel_lock_mask, original_samples.shape[-2], original_samples.shape[-1], boundary_strength)
     lock_has_effect = _has_mask_effect(alpha)
-    if lock_has_effect and original_samples is None:
-        if original_image is None or vae is None:
-            raise ValueError("PixelLockSampler needs original_image and vae when original_latent is not connected.")
-        original_samples = _encode_original_latent(vae, _image_to_bhwc(original_image), latent)
-
-    locked_latent_image = _apply_latent_lock(latent_image, original_samples, alpha) if lock_has_effect else latent_image
-    lock_denoise_mask = (1.0 - alpha).clamp(0.0, 1.0)
-    lock_denoise_mask = _expand_batch(lock_denoise_mask, latent_image.shape[0], "pixel lock denoise mask")
+    locked_latent_image = original_samples
+    lock_denoise_mask = _latent_denoise_mask(
+        pixel_lock_mask,
+        original_samples.shape[-2],
+        original_samples.shape[-1],
+        boundary_strength,
+        edit_strength,
+    )
+    lock_denoise_mask = _expand_batch(lock_denoise_mask, original_samples.shape[0], "pixel lock denoise mask")
     noise_mask = None if _is_full_denoise_mask(lock_denoise_mask) else lock_denoise_mask
-    if "noise_mask" in latent:
-        existing_noise_mask = _resize_mask(latent["noise_mask"], latent_image.shape[-2], latent_image.shape[-1])
-        existing_noise_mask = _expand_batch(existing_noise_mask, latent_image.shape[0], "latent noise mask")
-        noise_mask = existing_noise_mask * lock_denoise_mask
 
     def callback(step: int, denoised: torch.Tensor, current: torch.Tensor, total_steps: int) -> None:
         base_callback(step, denoised, current, total_steps)
@@ -235,9 +235,9 @@ def _sample_with_lock(
     if lock_has_effect:
         samples = _apply_latent_lock(samples, original_samples, alpha)
 
-    out = latent.copy()
-    out.pop("downscale_ratio_spacial", None)
-    out["samples"] = samples
+    out = {"samples": samples}
+    if batch_inds is not None:
+        out["batch_index"] = batch_inds
     return (out,)
 
 
@@ -319,10 +319,10 @@ class PixelLockSampler:
                 "scheduler": (SCHEDULER_NAMES,),
                 "positive": ("CONDITIONING",),
                 "negative": ("CONDITIONING",),
-                "latent_image": ("LATENT",),
                 "pixel_lock_mask": (PIXEL_LOCK_MASK,),
                 "boundary_strength": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "edit_strength": ("FLOAT", {"default": 0.85, "min": 0.0, "max": 1.0, "step": 0.01}),
             },
             "optional": {
                 "original_image": ("IMAGE",),
@@ -346,15 +346,16 @@ class PixelLockSampler:
         scheduler: str,
         positive: Any,
         negative: Any,
-        latent_image: dict[str, Any],
         pixel_lock_mask: dict[str, Any],
         boundary_strength: float,
         denoise: float,
+        edit_strength: float,
         original_image: torch.Tensor | None = None,
         vae: Any | None = None,
         original_latent: dict[str, Any] | None = None,
     ):
         original_samples = original_latent["samples"] if original_latent is not None else None
+        batch_inds = original_latent.get("batch_index") if original_latent is not None else None
 
         return _sample_with_lock(
             model,
@@ -365,13 +366,14 @@ class PixelLockSampler:
             scheduler,
             positive,
             negative,
-            latent_image,
             original_samples,
+            batch_inds,
             original_image,
             vae,
             pixel_lock_mask,
             boundary_strength,
             denoise,
+            edit_strength,
         )
 
 
@@ -420,14 +422,51 @@ class PixelLockComposite:
         return (image.clamp(0.0, 1.0),)
 
 
+class PixelLockDecodeComposite:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "samples": ("LATENT",),
+                "vae": ("VAE",),
+                "original_image": ("IMAGE",),
+                "pixel_lock_mask": (PIXEL_LOCK_MASK,),
+                "boundary_strength": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.01}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "decode_composite"
+    CATEGORY = CATEGORY
+
+    def decode_composite(
+        self,
+        samples: dict[str, Any],
+        vae: Any,
+        original_image: torch.Tensor,
+        pixel_lock_mask: dict[str, Any],
+        boundary_strength: float,
+    ):
+        latent = samples["samples"]
+        if latent.is_nested:
+            latent = latent.unbind()[0]
+        generated = vae.decode(latent)
+        if len(generated.shape) == 5:
+            generated = generated.reshape(-1, generated.shape[-3], generated.shape[-2], generated.shape[-1])
+        return PixelLockComposite().composite(original_image, generated, pixel_lock_mask, boundary_strength)
+
+
 NODE_CLASS_MAPPINGS = {
     "PixelLockerMaskBuilder": MaskBuilder,
     "PixelLockerPixelLockSampler": PixelLockSampler,
     "PixelLockerPixelLockComposite": PixelLockComposite,
+    "PixelLockerPixelLockDecodeComposite": PixelLockDecodeComposite,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PixelLockerMaskBuilder": "MaskBuilder",
     "PixelLockerPixelLockSampler": "PixelLockSampler",
     "PixelLockerPixelLockComposite": "PixelLockComposite",
+    "PixelLockerPixelLockDecodeComposite": "PixelLockDecodeComposite",
 }

@@ -20,6 +20,8 @@ ComfyUI custom nodes for preserving masked pixels while sampling.
 
 `PixelLockSampler` protects structure in latent space. `PixelLockComposite` is required for absolute pixel preservation because VAE encode/decode is not lossless.
 
+For better performance, connect a `VAEEncode` of the original image to PixelLockSampler's optional `original_latent` input. Otherwise connect `original_image` and `vae`; PixelLockSampler will encode the original image only when the lock mask has an active hard or soft area.
+
 ## Mask Semantics
 
 `MaskBuilder` supports two base mask modes:

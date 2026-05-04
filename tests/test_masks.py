@@ -3,7 +3,7 @@ import unittest
 import torch
 import torch.nn.functional as F
 
-from nodes import MaskBuilder, PixelLockComposite, _denoise_mask_from_lock
+from nodes import MaskBuilder, PixelLockComposite, _denoise_mask_from_lock, _has_mask_effect, _is_full_denoise_mask
 
 
 class MaskBuilderTests(unittest.TestCase):
@@ -94,6 +94,12 @@ class PixelLockSamplerMaskTests(unittest.TestCase):
         self.assertTrue(torch.all(denoise_mask[:, :, 1:3, 1:3] == 0.0))
         self.assertTrue(torch.all(denoise_mask[:, :, 0, :] == 0.75))
         self.assertEqual(float(denoise_mask[:, :, 3, 0]), 1.0)
+
+    def test_no_lock_can_skip_inpaint_mask_path(self):
+        denoise_mask = torch.ones((1, 1, 4, 4))
+
+        self.assertFalse(_has_mask_effect(torch.zeros_like(denoise_mask)))
+        self.assertTrue(_is_full_denoise_mask(denoise_mask))
 
 
 if __name__ == "__main__":
